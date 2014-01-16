@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Script written by Daniel Frank
+# Purpose:
+#       This script tricks SSH into accepting a password through a pipe.
+#       1. The script check if the session is connected to a terminal,
+#          if yes, the script will restart itself by relogging into the
+#               current host through ssh without allocating a pty.
+#       2. After the command line is parsed, the password is read from stdin.
+#       3. The script sets up a named pipe and exports the name in the
+#               environment.
+#       4. The script sets the DISPLAY variable to a dummy value.
+#       5. The script sets the SSH_ASKPASS variable to point to itself.
+#       6. SSH is started, which will execute the SSH_ASKPASS instance of
+#               this script.
+#       6. The script provides the password to its SSH_ASKPASS instance
+#               through the pipe.
+#       7. The SSH_ASKPASS instance of the script echoes out the password
+#               to SSH.
+
+
+# if FIFO is set, the script is actually run by SSH as SSH_ASKPASS
+if [ -n "$FIFO" ]; then
+        cat $FIFO
+        exit
+fi
+
+# Resolve the path of the script
+SCRIPTPATH="$( cd $(dirname $0) ; pwd -P )/$(basename $0)"
+
+if [ "$#" -eq 0 ]; then
+        echo "Usage: $0 <USER> <SERVER1> [SERVER2 ...] -- <COMMAND LINE>"
+        echo "Example: daniel server1 server2 -- hostname"
+        echo " (use four backslashes where you want to have one)"
+        exit 1
+fi
+
+# If the session the script is running in has a terminal connected to it,
+# SSH will not accept the password from a pipe, so we just relogin to
+# the current host without a terminal and pass all parameters.
+if [ -t 0 ]; then
+        ssh -T $LOGNAME@$(hostname) $SCRIPTPATH $@
+        exit
+fi
+
+# Parse the command line
+DOMUSER="$1"
+shift
+while [ "$#" -gt 0 ]; do
+        case "$1" in
+                "--")
+                        NOMORESERVERS=1
+                        ;;
+                *)
+                        if [ -n "$NOMORESERVERS" ]; then
+                                if [ -z "$COMMAND" ]; then
+                                        COMMAND="$1"
+                                else
+                                        COMMAND="$COMMAND $1"
+                                fi
+                        else
+                                if [ -z "$SERVERS" ]; then
+                                        SERVERS="$1"
+                                else
+                                        SERVERS="$SERVERS $1"
+                                fi
+                        fi
+                        ;;
+        esac
+        shift
+done
+
+echo DOMUSER: $DOMUSER
+echo SERVERS:  $SERVERS
+echo COMMAND: $COMMAND
+
+# Request the password
+echo -n Enter your password to execute the command as listed above, cancel with CTRL-C:\
+PASS="$(head -1)"
+
+# Loop over all servers
+for SERVER in $SERVERS; do
+        # Setup a fifo
+        FIFO=$(mktemp)
+        rm $FIFO; mkfifo $FIFO || exit
+        export FIFO
+        # DISPLAY has to be set to a dummy value, or SSH will ignore the SSH_ASKPASS variable
+        export DISPLAY=dummy:1
+        # SSH_ASKPASS points to this script, which will check if the variable FIFO is set
+        # and just output the password that comes through the FIFO.
+        export SSH_ASKPASS="$SCRIPTPATH"
+        echo \### $SERVER: $COMMAND | sed -e 's_._#_g'
+        echo \### $SERVER: $COMMAND
+        # Run SSH in background so we can pass the password through the FIFO.
+        ssh -o StrictHostKeyChecking=yes $DOMUSER@$SERVER $COMMAND &
+        # pass the password through the FIFO
+        echo "$PASS" > $FIFO
+        # Wait until ssh exits
+        wait
+        # remove the FIFO
+        rm $FIFO
+done
